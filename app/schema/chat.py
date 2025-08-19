@@ -1,12 +1,17 @@
-from pydantic import BaseModel
-from typing import List, Dict, Any
+#chat.py
+from typing import List, Dict, Optional
+from pydantic import BaseModel, Field
 
 class ChatRequest(BaseModel):
-    """Request model for the chat endpoint."""
-    query: str
-    conversation_history: List[Dict[str, Any]] = []
+    query: str = Field(..., description="User message")
+    history: List[Dict[str, str]] = Field(
+        default_factory=list,
+        description='[{ "type": "human"|"ai", "content": "..." }]'
+    )
+    session_id: Optional[str] = Field(None, description="Session identifier to persist chat and client_id")
+    client_id: Optional[str] = Field(None, description="Optional client id to set/override for this session")
 
 class ChatResponse(BaseModel):
-    """Response model for the chat endpoint."""
     answer: str
-    updated_history: List[Dict[str, Any]]
+    history: List[Dict[str, str]]
+    client_id: Optional[str] = None

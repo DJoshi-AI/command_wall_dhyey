@@ -1,19 +1,35 @@
-from fastapi import APIRouter, HTTPException, Depends
+#chat_router.py
+from fastapi import APIRouter, HTTPException, Request
 from app.schema.chat import ChatRequest, ChatResponse
-from app.agent.graph import GraphWrapper
+from app.services.mongo import list_clients, create_client
 
-router = APIRouter()
+router = APIRouter(prefix="/agent", tags=["agent"])
 
-def get_agent_graph():
-    # This creates a new instance per request. For production, consider a singleton pattern.
-    return GraphWrapper()
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat_with_agent(request: ChatRequest, agent_graph: GraphWrapper = Depends(get_agent_graph)):
+def chat_with_agent(req: ChatRequest, request: Request):
+    graph = request.app.state.graph
     try:
-        answer, updated_history = agent_graph.invoke(request.query, request.conversation_history)
-        return ChatResponse(answer=answer, updated_history=updated_history)
+        answer, updated_history = graph.invoke(
+            query=req.query,
+            history=req.history or [],
+            client_id=req.client_id,
+            session_id=req.session_id,
+        )
+        return ChatResponse(answer=answer, history=updated_history, client_id=req.client_id)
     except Exception as e:
-        print(f"An error occurred in chat_with_agent: {e}")
-        raise HTTPException(status_code=500, detail="An internal error occurred while processing your request.")
+        print("An error occurred in chat_with_agent:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.get("/clients")
+def get_clients():
+    return list_clients()
+
+
+@router.post("/clients")
+def add_client(client: dict):
+    ok = create_client(client)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Client already exists or invalid payload")
+    return {"ok": True}

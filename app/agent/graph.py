@@ -1,8 +1,9 @@
+#graph.py
 import os
 import re
 import operator
 import json
-from typing import TypedDict, List, Annotated, Dict, Any
+from typing import TypedDict, List, Annotated, Dict, Any, Optional
 
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import urlopen, Request
@@ -14,20 +15,29 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import ToolNode
 from langchain_ollama import ChatOllama
 
-from app.services.dummy_services import VALID_CLIENT_ID
 from app.agent.agent_tools import all_tools
+from app.services.mongo import (
+    get_active_client_id,
+    set_active_client_id,
+    add_message,
+    get_messages,
+)
+
+
+def prefer_new_nonempty(x: str, y: str) -> str:
+    return y if (y and y.strip()) else x
 
 
 class AgentState(TypedDict):
     messages: Annotated[List[AnyMessage], operator.add]
-    client_id: str
+    client_id: Annotated[str, prefer_new_nonempty]
 
 
 class GraphWrapper:
-    def __init__(
+    def _init_(
         self,
-        model_name: str | None = None,
-        base_url: str | None = None,
+        model_name: Optional[str] = None,
+        base_url: Optional[str] = None,
         temperature: float = 0.2,
         top_k: int = 30,
         top_p: float = 0.9,
@@ -39,7 +49,6 @@ class GraphWrapper:
             or os.getenv("OLLAMA_HOST")
             or "http://127.0.0.1:11434"
         )
-        # Default to a tool-capable model
         model_name = model_name or os.getenv("OLLAMA_MODEL_NAME", "qwen2.5:7b-instruct")
 
         print(f"[GraphWrapper] Using Ollama base_url: {base_url}")
@@ -50,22 +59,17 @@ class GraphWrapper:
 
         if not self._model_exists(base_url, model_name):
             raise ImportError(
-                f'Ollama model "{model_name}" not found on {base_url}. '
-                f'Run: ollama pull {model_name}'
+                f'Ollama model "{model_name}" not found on {base_url}. Run: ollama pull {model_name}'
             )
 
-        try:
-            self.llm = ChatOllama(
-                model=model_name,
-                base_url=base_url,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                num_ctx=num_ctx,
-            )
-        except Exception as e:
-            print(f"Error initializing ChatOllama at {base_url}: {e}")
-            raise ImportError("Failed to initialize ChatOllama.")
+        self.llm = ChatOllama(
+            model=model_name,
+            base_url=base_url,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            num_ctx=num_ctx,
+        )
 
         self.memory = MemorySaver()
         self.graph = self._build_graph()
@@ -86,11 +90,8 @@ class GraphWrapper:
         try:
             with urlopen(f"{base_url}/api/tags", timeout=3) as resp:
                 return 200 <= resp.status < 300
-        except URLError as e:
-            print(f"[GraphWrapper] Ollama preflight failed for {base_url}: {e}")
-            return False
         except Exception as e:
-            print(f"[GraphWrapper] Unexpected preflight error for {base_url}: {e}")
+            print(f"[GraphWrapper] Ollama preflight failed for {base_url}: {e}")
             return False
 
     def _model_exists(self, base_url: str, model_name: str) -> bool:
@@ -103,30 +104,28 @@ class GraphWrapper:
             )
             with urlopen(req, timeout=5) as resp:
                 return 200 <= resp.status < 300
-        except HTTPError as e:
-            if e.code == 404:
-                return False
-            print(f"[GraphWrapper] /api/show error ({e.code}) for {model_name}: {e}")
-            return False
-        except Exception as e:
-            print(f"[GraphWrapper] Model check failed for {model_name}: {e}")
+        except Exception:
             return False
 
     def _build_graph(self):
-        system_prompt = f"""You are a helpful assistant for a SaaS company, designed to analyze business performance data. Your goal is to provide accurate information based on the user's query about a client account.
+        system_prompt = """You are a helpful assistant for a SaaS company, designed to analyze business performance data.
+- When a user asks for data (e.g., KPIs, churn, trends), you MUST provide a client_id to the tools.
+- If a client_id is not known and the request requires one, ask the user for the client_id.
+- Reuse the last active client_id for the session unless the user specifies a new one.
+- If the provided client_id is invalid or unknown, inform the user and ask for a valid one.
+- For general chit-chat, respond directly without using tools.
+- Use the available tools to answer questions about KPI summaries, detailed data, anomalies, and KPI trends.
+- Always include the client_id argument in tool calls that require it."""
 
-- When a user asks a question that requires data (e.g., "show me KPIs" or "what's our churn trend?"), you MUST have a client_id to use the tools.
-- The client_id is a hex string. The only valid one for this demo is {VALID_CLIENT_ID}.
-- If the user provides a client ID, use it for the tool calls.
-- If the client_id is NOT in the conversation history and the user's query requires it, you MUST ask the user for the client_id. Do NOT try to guess or use a placeholder.
-- If the user provides an invalid client_id, the tools will return an empty response. You must inform the user that the data is not available for that ID.
-- For general conversation (e.g., "hello", "what can you do?"), respond directly without using tools.
-- Use the available tools to answer questions about SaaS KPI summaries, detailed data, business anomalies, and KPI trends."""
-        
         llm_with_tools = self.llm.bind_tools(all_tools)
 
         def agent_node(state: AgentState):
-            messages_with_system_prompt = [SystemMessage(content=system_prompt)] + state['messages']
+            messages_with_system_prompt = [SystemMessage(content=system_prompt)]
+            if state.get("client_id"):
+                messages_with_system_prompt.append(
+                    SystemMessage(content=f"Active client_id for this session: {state['client_id']}")
+                )
+            messages_with_system_prompt += state["messages"]
             response = llm_with_tools.invoke(messages_with_system_prompt)
             return {"messages": [response]}
 
@@ -146,29 +145,50 @@ class GraphWrapper:
         graph.add_edge("tools", "agent")
         return graph.compile(checkpointer=self.memory)
 
-    def _extract_client_id(self, text: str) -> str | None:
-        match = re.search(r'\b([a-fA-F0-9]{8,})\b', text)
+    def _extract_client_id(self, text: str) -> Optional[str]:
+        # Allow IDs like "client1" as well as hex-like IDs
+        match = re.search(r"\b([A-Za-z0-9_\-]{4,})\b", text)
         return match.group(1) if match else None
 
-    def invoke(self, query: str, history: List[Dict[str, Any]]):
-        messages = [
-            HumanMessage(content=m["content"]) if m["type"] == "human" else AIMessage(content=m["content"])
-            for m in history
-        ]
+    def invoke(
+        self,
+        query: str,
+        history: List[Dict[str, Any]],
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
+        session_key = session_id or "default_session"
+
+        # Rebuild messages from provided history (backward compatible)
+        messages: List[AnyMessage] = []
+        for m in history:
+            if m.get("type") == "human":
+                messages.append(HumanMessage(content=m["content"]))
+            elif m.get("type") == "ai":
+                messages.append(AIMessage(content=m["content"]))
         messages.append(HumanMessage(content=query))
         messages = messages[-10:]
 
-        client_id = ""
-        for msg in reversed(messages):
-            extracted_id = self._extract_client_id(str(msg.content))
-            if extracted_id:
-                client_id = extracted_id
-                break
+        # Determine effective client_id (param > stored session > inferred)
+        effective_client_id = (
+            (client_id or "").strip()
+            or get_active_client_id(session_key)
+            or self._extract_client_id(" ".join(str(m.content) for m in messages))
+            or ""
+        )
 
-        thread_id = "user_session_123"
-        config = {"configurable": {"thread_id": thread_id}}
-        
-        final_state = self.graph.invoke({"messages": messages, "client_id": client_id}, config=config)
+        # Persist active client_id if present
+        if effective_client_id:
+            set_active_client_id(session_key, effective_client_id)
+
+        # Persist incoming human message in Mongo
+        add_message(session_key, "human", query)
+
+        # Invoke graph
+        final_state = self.graph.invoke(
+            {"messages": messages, "client_id": effective_client_id},
+            config={"configurable": {"thread_id": session_key}},
+        )
 
         final_messages = final_state.get("messages", [])
         answer = (
@@ -177,10 +197,15 @@ class GraphWrapper:
             else "Sorry, I encountered an issue. Could you rephrase?"
         )
 
-        updated_history_dicts = []
+        # Persist AI reply
+        add_message(session_key, "ai", answer)
+
+        # Return updated history like before
+        updated_history_dicts: List[Dict[str, str]] = []
         for msg in final_messages:
             if isinstance(msg, HumanMessage):
                 updated_history_dicts.append({"type": "human", "content": msg.content})
             elif isinstance(msg, AIMessage):
                 updated_history_dicts.append({"type": "ai", "content": msg.content})
+
         return answer, updated_history_dicts

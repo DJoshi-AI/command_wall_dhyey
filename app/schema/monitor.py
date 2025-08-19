@@ -1,12 +1,8 @@
-from pydantic import BaseModel, Field
-from datetime import datetime
-from typing import Optional
+#monitor.py
+from pydantic import BaseModel
 
 class MonitoringItem(BaseModel):
-    """Data model for a single KPI monitoring data point."""
     date: str
-    kpi_name: str
+    kpi_name: str  # "monthly_recurring_revenue" | "churn_rate" | "active_users"
     value: float
-    status: str
-    updated_at: Optional[datetime] = Field(default_factory=datetime.now)
-
+    status: str    # "green" | "yellow" | "red"
