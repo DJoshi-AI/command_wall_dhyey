@@ -71,20 +71,20 @@ def list_months() -> List[str]:
 
 
 @mcp.tool()
-def list_kpis(sample_month: Optional[str] = None) -> List[str]:
+def list_kpis(sample_month: Optional[str] = None, scan_all: bool = True) -> List[str]:
     """
-    List distinct KPI names found. If sample_month is provided (YYYY-MM),
-    only that month is scanned; otherwise the first available CSV is used.
+    List distinct KPI names. By default scan_all=True to scan all CSVs.
+    If scan_all=False and sample_month is provided, only that month is scanned.
     """
-    # Pick a sample file to scan
-    if sample_month:
+    files = []
+    if scan_all or not sample_month:
+        files = sorted(BASE_DIR.glob("kpis_*.csv"))
+    else:
         try:
             y, m = [int(x) for x in sample_month.split("-")]
             files = [BASE_DIR / FILENAME_TEMPLATE.format(year=y, month=m)]
         except Exception:
             files = []
-    else:
-        files = sorted(BASE_DIR.glob("kpis_*.csv"))[:1]
 
     names = set()
     for p in files:
@@ -93,8 +93,9 @@ def list_kpis(sample_month: Optional[str] = None) -> List[str]:
         with p.open("r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if "kpi_name" in row and row["kpi_name"]:
-                    names.add(row["kpi_name"])
+                n = row.get("kpi_name")
+                if n:
+                    names.add(n)
     return sorted(names)
 
 
